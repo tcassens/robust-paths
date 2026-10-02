@@ -1,10 +1,10 @@
+"""Cost-optimal pathway and the near-optimal space of each horizon, in two tech dimensions."""
+
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import pypsa
-from scipy.optimize import linprog
 from scipy.spatial import ConvexHull, QhullError
 
 # config
@@ -38,15 +38,14 @@ Y_TECH = "backup"
 LINK_OUTPUT_CAPACITY = True
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "figures" if "__file__" in globals() else Path("../figures")
-OUTPUT_PNG = OUTPUT_DIR / f"{X_TECH}_{Y_TECH}_near_opt_space_per_horizon.png"  # set to None to skip saving
+OUTPUT_PNG = OUTPUT_DIR / f"{X_TECH}_{Y_TECH}_cost_opt_pathway.png"  # set to None to skip saving
 
 RESULTS = PYPSA_EUR / "results" / RUN
 CACHE = PYPSA_EUR / "mga-cache"
 
 
-def component_info(horizon):
-    """(component, name) -> carrier and capacity factor to plotted unit, from the horizon's solved network."""
-    n = pypsa.Network(RESULTS / "networks" / f"base_s_{CLUSTERS}___{horizon}.nc")
+def component_info(n):
+    """(component, name) -> carrier and capacity factor to plotted unit."""
     frames = []
     for c in {comp for comp, _ in TECHS.values()}:
         df = n.static(c)
@@ -55,45 +54,37 @@ def component_info(horizon):
     return pd.concat(frames).set_index(["component", "name"])
 
 
-def tech_capacities(caps_csv, info):
-    """Sum capacity of X_TECH and Y_TECH in a caps CSV (MW)."""
-    caps = pd.read_csv(caps_csv)
-    caps = caps[caps.attribute.isin(["p_nom_opt", "e_nom_opt"])].set_index(["component", "name"]).value
+def tech_capacities(caps, info, source):
+    """Sum capacity of X_TECH and Y_TECH from a (component, name) -> capacity series (MW)."""
     out = {}
     for tech in (X_TECH, Y_TECH):
         component, carriers = TECHS[tech]
         idx = info.index[(info.index.get_level_values(0) == component) & info.carrier.isin(carriers)]
         missing = idx.difference(caps.index)
         if len(missing):
-            raise KeyError(f"{caps_csv.name}: {tech} components missing from caps: {list(missing)[:5]}")
+            raise KeyError(f"{source}: {tech} components missing from caps: {list(missing)[:5]}")
         out[tech] = (caps.loc[idx] * info.loc[idx, "scale"]).sum()
     return out
 
 
-def chebyshev_center(points):
-    """Point maximizing the minimum distance to every edge of the convex hull of `points`."""
-    hull = ConvexHull(points)
-    A = hull.equations[:, :-1]
-    b = hull.equations[:, -1]
-    # maximize r s.t. A_i . x + r <= -b_i for every facet (hull.equations is unit-normalized)
-    c = np.array([0, 0, -1])
-    A_ub = np.hstack([A, np.ones((A.shape[0], 1))])
-    b_ub = -b
-    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(None, None), (None, None), (0, None)])
-    return res.x[:2], res.x[2]  # center, margin (distance to nearest edge)
+def read_caps(caps_csv):
+    caps = pd.read_csv(caps_csv)
+    return caps[caps.attribute.isin(["p_nom_opt", "e_nom_opt"])].set_index(["component", "name"]).value
 
 
 level_pts = {}
 cost_opt_pts = {}
 for h in HORIZONS:
-    info = component_info(h)
-    cand = pd.read_csv(RESULTS / "resilience" / f"mga_candidates_base_s_{CLUSTERS}___{h}.csv")
+    stem = f"base_s_{CLUSTERS}___{h}"
+    info = component_info(pypsa.Network(RESULTS / "networks" / f"{stem}.nc"))
+    network_hash = (RESULTS / "near_opt" / f"{stem}_network_hash.txt").read_text().strip()
     rows = {}
-    for r in cand.itertuples():
-        direction = f"s{r.v_solar:+.2f} on{r.v_onwind:+.2f} off{r.v_offwind:+.2f} b{r.v_backup:+.2f}"
-        rows[direction] = tech_capacities(CACHE / "caps" / f"caps_{r.network_hash}_{r.direction_hash}.csv", info)
+    for d in pd.read_csv(RESULTS / "near_opt" / f"{stem}.csv").dir_hash:
+        caps_csv = CACHE / "caps" / f"caps_{network_hash}_{d}.csv"
+        rows[d] = tech_capacities(read_caps(caps_csv), info, caps_csv.name)
     level_pts[h] = pd.DataFrame(rows).T[[X_TECH, Y_TECH]]
-    cost_opt_pts[h] = tech_capacities(RESULTS / "resilience" / f"cost_opt_caps_base_s_{CLUSTERS}___{h}.csv", info)
+    caps_csv = RESULTS / "resilience" / f"cost_opt_caps_{stem}.csv"
+    cost_opt_pts[h] = tech_capacities(read_caps(caps_csv), info, caps_csv.name)
 
 for h, df in level_pts.items():
     print(f"{h}: {len(df)} directions, cost-optimal {X_TECH} {cost_opt_pts[h][X_TECH]/1e3:.2f} GW, "
@@ -108,37 +99,34 @@ colors = [cmap(i / max(len(level_pts) - 1, 1)) for i in range(len(level_pts))]
 
 for (h, df), color in zip(level_pts.items(), colors):
     pts_gw = df.values / 1e3
-
     try:
         hull = ConvexHull(pts_gw)
     except QhullError:
         print(f"{h}: points are degenerate (collinear/duplicate), no hull drawn")
         ax.scatter(*pts_gw.T, color=color, s=15, label=h)
     else:
-        for k, simplex in enumerate(hull.simplices):
-            ax.plot(
-                pts_gw[simplex, 0],
-                pts_gw[simplex, 1],
-                color=color,
-                alpha=0.8,
-                linewidth=2,
-                label=h if k == 0 else None,
-            )
-        center, margin = chebyshev_center(pts_gw)
-        ax.scatter(*center, color=color, marker="X", s=40, edgecolor="black", linewidth=0.5, zorder=5)
-        print(f"{h}: Chebyshev center = ({center[0]:.2f}, {center[1]:.2f}) GW, margin = {margin:.3f} GW, "
-              f"hull area = {hull.volume:.1f} GW²")
+        ring = pts_gw[list(hull.vertices) + [hull.vertices[0]]]
+        ax.plot(*ring.T, color=color, alpha=0.8, linewidth=2, label=h)
+        ax.fill(*ring.T, color=color, alpha=0.1, linewidth=0)
 
     co = cost_opt_pts[h]
     ax.scatter(co[X_TECH] / 1e3, co[Y_TECH] / 1e3, color=color, marker="*", s=200,
                edgecolor="black", linewidth=0.7, zorder=6)
 
-ax.scatter([], [], color="grey", marker="*", s=200, edgecolor="black", linewidth=0.7, label="cost-optimal")
-ax.scatter([], [], color="grey", marker="X", s=40, edgecolor="black", linewidth=0.5, label="Chebyshev center")
+# cost-optimal pathway: arrows from one horizon's cost-optimal network to the next
+path = pd.DataFrame(cost_opt_pts).T / 1e3
+for (_, a), (_, b) in zip(path.iloc[:-1].iterrows(), path.iloc[1:].iterrows()):
+    ax.annotate("", xy=(b[X_TECH], b[Y_TECH]), xytext=(a[X_TECH], a[Y_TECH]),
+                arrowprops=dict(arrowstyle="->", color="black", linewidth=1.2, shrinkA=8, shrinkB=8), zorder=5)
 
-all_pts = pd.concat(level_pts.values()) / 1e3
+ax.scatter([], [], color="grey", marker="*", s=200, edgecolor="black", linewidth=0.7, label="cost-optimal")
+ax.plot([], [], color="black", linewidth=1.2, label="cost-optimal pathway")
+
+all_pts = pd.concat([*level_pts.values(), path * 1e3]) / 1e3
 ax.set_xlim(0, 1.05 * all_pts[X_TECH].max())
 ax.set_ylim(0, 1.05 * all_pts[Y_TECH].max())
+
+
 def axis_label(tech):
     electric = TECHS[tech][0] == "Link" and LINK_OUTPUT_CAPACITY
     return f"{tech.capitalize()} capacity (GW{', electric output' if electric else ''})"
@@ -146,7 +134,7 @@ def axis_label(tech):
 
 ax.set_xlabel(axis_label(X_TECH))
 ax.set_ylabel(axis_label(Y_TECH))
-ax.set_title(f"Near-optimal space in {X_TECH}-{Y_TECH} coordinate space")
+ax.set_title(f"Near-optimal pathway in {X_TECH}-{Y_TECH} space")
 ax.legend()
 fig.tight_layout()
 
